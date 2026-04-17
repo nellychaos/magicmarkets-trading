@@ -6,8 +6,9 @@ A Claude Code plugin that helps you integrate the **MagicMarkets Trading API** �
 
 When you ask Claude Code about placing bets, managing orders, or building a trading bot, this plugin provides:
 
-- **Accurate API guidance** — correct endpoints, auth headers, USDT tuple format, and response structures
-- **Working code snippets** — Python examples for the full trading workflow (betslip → order → monitoring)
+- **Accurate API guidance** — correct endpoints, auth headers, USDT tuple format, response envelopes, and the nested `effective` wrapper on price lists
+- **Back, lay, and parlay coverage** — the three bet types, when to use each, and how they differ
+- **Working code snippets** — Python examples for betslip creation, order placement with idempotency, parlay settlement, and P&L aggregation
 - **Live API calls** — if you have an API key configured, Claude can query your orders and demonstrate endpoints
 - **Reference lookups** — order fields, bet fields, event info variants, sport codes, bet type patterns
 
@@ -33,10 +34,18 @@ After installing, just ask Claude Code naturally:
 |--------|-------|
 | **Base URL** | `https://api.magicmarkets.com` |
 | **Auth** | `X-Api-Key` header (long-lived token, up to 365 days) |
-| **Stake format** | `["USDT", <amount>]` tuples |
+| **Stake format (responses)** | `["USDT", <amount>]` tuples |
+| **Stake format (requests)** | `[currency, amount]` — any currency accepted |
 | **Workflow** | Create betslip → review prices → place order → monitor |
-| **Order types** | Normal, lay, parlay |
+| **Bet types** | **Back** (normal), **Lay**, **Parlay** (accumulator, 2-10 legs) |
+| **Exchange modes** | `make_and_take` (default), `make`, `take` |
 | **Sports** | Football, basketball, tennis, ice hockey, baseball, and 16 more |
+
+### Back vs lay
+
+- **Back** (`betslip_type: "normal"`) — you win if the outcome happens (traditional betting)
+- **Lay** (`betslip_type: "lay"`) — you act as the bookmaker; you win if the outcome does NOT happen
+- **Parlay** — combine 2-10 back bets into one; all must win
 
 ## Configuration
 
