@@ -22,19 +22,39 @@ All requests authenticated via `X-Api-Key: <token>` header (unless noted).
 
 ## The three bet types
 
+### Dimension 1: Selection side (bet_type prefix)
+
+Every `bet_type` starts with `for,...` or `against,...`:
+
+- `for,...` — you're picking the outcome to happen
+- `against,...` — you're picking the outcome NOT to happen (common in multirunner
+  markets: `against,win,<runner_id>` = "runner will not win")
+
+### Dimension 2: Order type
+
 | `betslip_type` / `order_type` | Meaning |
 |-------------------------------|---------|
-| `normal` | **Back** bet — win if the outcome happens |
-| `lay` | **Lay** bet — win if the outcome does NOT happen |
+| `normal` | **Back** bet — classic; win if your selection happens |
+| `lay` | **Lay** bet — act as bookmaker; win if your selection does NOT happen |
 | `parlay` | **Accumulator** — 2-10 legs combined; all must win |
 
+### Combinations
+
+The same market can be expressed four ways via the two dimensions:
+
+| order_type | bet_type | Description |
+|------------|----------|-------------|
+| `normal` | `for,...` | Back the "for" side (most common) |
+| `normal` | `against,...` | Back the "against" side |
+| `lay` | `for,...` | Lay the "for" side |
+| `lay` | `against,...` | Lay the "against" side |
+
+Economically, `normal + for` ≈ `lay + against`, but they route through different
+liquidity pools.
+
 A normal bet at 2.00 for 10 USDT pays 20 USDT on win (profit +10).
-
-A lay bet at 2.00 for 10 USDT wins 10 USDT if the outcome does not occur;
-loses 10 × (2.00 − 1) = 10 USDT if it does.
-
-Parlay odds multiply across legs (approximately): three legs at 2.00 each
-combine to ~8.00.
+A lay bet at 2.00 for 10 USDT wins 10 USDT if the selection loses; loses
+10 × (2.00 − 1) = 10 USDT if it wins.
 
 ---
 
@@ -195,7 +215,7 @@ stripped; all stakes in USDT.
 |-------|------|-------------|
 | `page` | integer | Page number (default 1) |
 | `page_size` | integer | Default 25, max 1000 |
-| `status` | string[] | `open`, `pending`, `done`, `failed` |
+| `status` | string[] | `open`, `pending`, `done`, `reconciled`, `failed`, `full_void` |
 | `sport` | string[] | Filter by sport code |
 | `event_id` | string[] | Filter by event ID |
 | `order_type` | string[] | `normal`, `lay`, `parlay` |
@@ -247,7 +267,7 @@ Full OrderResponse schema:
 | `event_info` | EventInfo | Event metadata (see below) |
 | `bets` | FormattedBetResponse[] | Individual fills |
 | `user_data` | string/null | Customer reference |
-| `status` | string | `open`, `pending`, `done`, `failed` |
+| `status` | string | `open`, `pending`, `done`, `reconciled`, `failed`, `full_void` |
 | `keep_open_ir` | boolean | In-running flag (default false) |
 | `exchange_mode` | string/null | `make_and_take`, `make`, `take` |
 | `price` | number/null | Matched price |
@@ -277,7 +297,7 @@ Each order's `bets` array contains FormattedBetResponse objects:
 | `want_stake` | `["USDT", n]`/null | Requested stake |
 | `got_stake` | `["USDT", n]`/null | Filled stake |
 | `profit_loss` | `["USDT", n]`/null | P&L |
-| `reconciled` | string/null | Reconciliation state (string, not boolean) |
+| `reconciled` | boolean/null | `true` once reconciled (despite OpenAPI saying string — real data is boolean) |
 | `exchange_role` | string/null | `maker`, `taker`, or null |
 | `legs` | ParlayLeg[]/null | For parlay bets |
 

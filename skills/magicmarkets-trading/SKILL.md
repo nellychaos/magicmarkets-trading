@@ -33,26 +33,49 @@ this skill directory.
 
 ---
 
-## The three bet types: back, lay, parlay
+## Two orthogonal dimensions: selection side × order type
 
-MagicMarkets supports three fundamentally different kinds of bets, distinguished
-by the `betslip_type` field (which becomes `order_type` once you place the order):
+Every order has two independent dimensions a developer must understand:
 
-| `betslip_type` | What it means | When to use |
-|---------------|--------------|-------------|
-| `normal` | **Back bet** — you win if the outcome happens | You think Liverpool will win |
-| `lay` | **Lay bet** — you act as the bookmaker; you win if the outcome does NOT happen | You think Liverpool will NOT win |
-| `parlay` | **Accumulator** — combine 2-10 legs; all must win for payout | You want to stack multiple back bets |
+### Dimension 1: Selection side (in `bet_type`)
 
-**Back vs lay** is the core exchange-trading distinction:
+Every `bet_type` string starts with either `for,...` or `against,...` — this
+is which **side of the market** you're picking:
 
-- A **back** bet at odds 2.00 with stake 10 USDT pays 20 USDT if it wins (profit 10)
-- A **lay** bet at odds 2.00 with stake 10 USDT means you accept 10 USDT if the outcome
-  does not occur, but pay out 10 USDT (10 × (2.00 − 1)) if it does
+| Prefix | Meaning |
+|--------|---------|
+| `for,...` | You're picking the outcome to happen (e.g. `for,mres,1` = home wins) |
+| `against,...` | You're picking the outcome NOT to happen (e.g. `against,win,2` = runner 2 won't win) |
 
-The Trading API surfaces both back and lay liquidity for the same selection — when
-you create a `normal` betslip you see the best prices to back; when you create a
-`lay` betslip you see the best prices to lay.
+`against` is particularly common in multirunner markets (outrights, futures)
+where you bet that a specific runner will NOT win the whole thing.
+
+### Dimension 2: Order type (`betslip_type` → `order_type`)
+
+| Value | What it means | When to use |
+|-------|--------------|-------------|
+| `normal` | **Back** the selection — classic bet; win if the selection happens | Most common — you think it'll happen |
+| `lay` | **Lay** the selection — act as bookmaker; win if the selection does NOT happen | Exchange-style trading |
+| `parlay` | **Accumulator** — combine 2-10 legs; all must win | Stacking multiple back bets |
+
+### Putting them together
+
+The same market can be expressed four different ways:
+
+| Combination | Example | Effect |
+|-------------|---------|--------|
+| `normal` + `for,...` | Back home to win | Classic back bet on home |
+| `normal` + `against,...` | Back home NOT to win | Classic back bet on "not home" |
+| `lay` + `for,...` | Lay home to win | Exchange lay on home winning |
+| `lay` + `against,...` | Lay home NOT to win | Exchange lay on "not home" |
+
+Economically, `normal + for` ≈ `lay + against`, but they route through different
+liquidity pools on the platform, so the prices and fills can differ.
+
+**A back at 2.00 for 10 USDT** pays 20 USDT if the selection wins (profit +10).
+
+**A lay at 2.00 for 10 USDT** wins 10 USDT if the selection loses; loses
+10 × (2.00 − 1) = 10 USDT if it wins.
 
 ---
 
@@ -289,12 +312,26 @@ curl "https://api.magicmarkets.com/v1/orders/updates/?updated_at_from=2026-04-14
 | Param | Values | Description |
 |-------|--------|-------------|
 | `page` / `page_size` | integers | Pagination (page_size max 1000) |
-| `status` | `open`, `pending`, `done`, `failed` | Order lifecycle state |
-| `sport` | sport codes | e.g. `fb`, `basket`, `tennis` |
-| `event_id` | event IDs | `YYYY-MM-DD,home_id,away_id` |
+| `status` | `open`, `pending`, `done`, `reconciled`, `failed`, `full_void` | Order lifecycle state |
+| `sport` | sport codes | e.g. `fb`, `basket`, `tennis`, `cricket` |
+| `event_id` | event IDs | `YYYY-MM-DD,home_id,away_id` or `YYYY-MM-DD,multirunner,<id>` |
 | `order_type` | `normal`, `lay`, `parlay` | Filter by back/lay/parlay |
 | `date_from` / `date_to` | ISO datetime | Placement time range |
 | `search` | string | Free text search |
+
+### Order lifecycle states
+
+| Status | Meaning |
+|--------|---------|
+| `open` | Order is live and matching |
+| `pending` | Placement in progress |
+| `done` | Bets filled, waiting for settlement |
+| `reconciled` | Bets settled with final P&L computed |
+| `failed` | All placement attempts failed (check `bets[].status.code`) |
+| `full_void` | Order was voided entirely (e.g. event cancelled) |
+
+A typical successful order goes `open` → `done` → `reconciled`. The `profit_loss`
+field is populated only at `reconciled`.
 
 ---
 
@@ -333,13 +370,13 @@ curl "https://api.magicmarkets.com/v1/orders/updates/?updated_at_from=2026-04-14
 |-------|------|-------------|
 | `bet_id` | integer | Unique bet ID |
 | `order_id` | integer | Parent order ID |
-| `status` | `{code, response_pmm}` | Status object with code (`success`, `failed`, `pending`) |
+| `status` | `{code, response_pmm}` | Status object. `code` values include `done`, `settled`, `failed`, `pending` |
 | `got_price` | number/null | Filled price |
-| `want_stake` | `["USDT", n]` | Requested stake |
+| `want_stake` | `["USDT", n]`/null | Requested stake |
 | `got_stake` | `["USDT", n]`/null | Filled stake |
 | `profit_loss` | `["USDT", n]`/null | P&L |
-| `reconciled` | string/null | Reconciliation state (string, not boolean) |
-| `exchange_role` | `maker`/`taker`/null | Exchange role |
+| `reconciled` | boolean/null | `true` once bet is reconciled, null before |
+| `exchange_role` | `maker`/`taker`/null | Exchange role (null for non-exchange fills) |
 | `ccy_rate` / `order_ccy_rate` | number | FX rates vs GBP |
 | `legs` | array/null | Per-leg details for parlays |
 
@@ -544,31 +581,82 @@ for leg in order["legs"]:
 
 | Code | Sport | Code | Sport |
 |------|-------|------|-------|
-| `fb` | Football | `tennis` | Tennis |
+| `fb` | Football (soccer) | `tennis` | Tennis |
 | `fb_ht` | Football - 1st half | `af` | American football |
 | `basket` | Basketball | `ih` | Ice hockey |
 | `baseball` | Baseball | `mma` | MMA |
-| `ru` | Rugby union | `rl` | Rugby league |
-| `hand` | Handball | `darts` | Darts |
-| `boxing` | Boxing | `snooker` | Snooker |
-| `arf` | Australian rules | `volley` | Volleyball |
+| `cricket` | Cricket | `rl` | Rugby league |
+| `ru` | Rugby union | `darts` | Darts |
+| `hand` | Handball | `snooker` | Snooker |
+| `boxing` | Boxing | `volley` | Volleyball |
+| `arf` | Australian rules | | |
 
 ### Bet type patterns
 
+Every bet_type starts with `for,` or `against,` — see the "Two orthogonal
+dimensions" section above. Common patterns observed in production:
+
+**Match result / moneyline:**
+
 | Pattern | Meaning |
 |---------|---------|
-| `for,1x2,1` | Home win |
-| `for,1x2,x` | Draw |
-| `for,1x2,2` | Away win |
-| `for,ah,h,-1` | Asian handicap, home -1 |
-| `for,ah,a,1` | Asian handicap, away +1 |
-| `for,ou,o,2.5` | Over 2.5 |
-| `for,ou,u,2.5` | Under 2.5 |
-| `for,h` | Moneyline / head-to-head |
-| `for,tp,all,ml,a` | Moneyline (inc. OT), away |
-| `for,mres,1` | Match result, home |
+| `for,mres,1` / `for,mres,x` / `for,mres,2` | Match result: home / draw / away |
+| `for,h` / `for,a` | Simple home / away (moneyline) |
+| `against,h` / `against,a` | Opposite side of simple home / away |
+| `for,ml,h` / `for,ml,a` | Moneyline home / away |
+| `for,tp,all,ml,h` | Moneyline incl. overtime, home |
+| `for,tp,reg,ml,h` | Moneyline regular time only, home |
+| `for,tp,reg,wdw,h` | Win-Draw-Win regular time, home |
+
+**Asian handicap and over/under:**
+
+| Pattern | Meaning |
+|---------|---------|
+| `for,ah,h,-20` | Asian handicap home **-5.0** (line × 4) |
+| `for,ah,a,20` | Asian handicap away **+5.0** |
+| `for,ou,o,25` | Over (line depends on sport encoding) |
+| `for,ou,u,25` | Under |
+
+Asian handicap and over/under lines are stored as integers in quarter-point
+units. Divide by 4 to get the displayed line — e.g. `-20` displays as `-5.0`.
+
+**Outrights / futures (multirunner markets):**
+
+| Pattern | Meaning |
+|---------|---------|
+| `for,win,<team_id>` | Runner wins outright |
+| `against,win,<team_id>` | Runner does NOT win outright |
+
+Used in season-long competitions where many runners compete. The `<team_id>`
+matches the runner's `team_id` in the multirunner EventInfo.
+
+**Other markets:**
+
+| Pattern | Meaning |
+|---------|---------|
+| `for,score,both` | Both teams to score |
+| `for,tset,all,vwhatever,p1` | Tennis total sets, player 1 |
+| `for,ir,1,1,ahover,14` | In-running composite (period, market, line) |
+
+The exact set of available bet types depends on sport and market. If you
+receive a bet_type you don't recognise, read the `bet_type_description` — it's
+always human-readable.
 
 ---
+
+## Close reasons
+
+When an order closes, `close_reason` explains why:
+
+| Value | Meaning |
+|-------|---------|
+| `order_filled` | Bet(s) placed successfully for the full stake |
+| `timed_out` | Order duration elapsed before full fill |
+| `cancelled` | Manually cancelled |
+| `event_score` | Closed because a goal/point was scored (pre-match orders on IR-suspended events) |
+| `event_became_inrunning` | Closed because the event went in-play (without `keep_open_ir`) |
+| `event_concluded` | Event finished before match |
+| `no_available_credit` | Out of credit across available bookmakers |
 
 ## Troubleshooting
 
@@ -577,13 +665,23 @@ for leg in order["legs"]:
 | `401 Unauthorized` | Token expired, cleared, or wrong header (must be `X-Api-Key`) |
 | `404` on `/web/token/` | Token management requires browser session auth, not API key |
 | `404` on `/v1/matrix/*` or `/bookie_*` | Intentionally blocked — bookie abstraction |
-| Empty `price_list` | Market suspended or no bookmaker coverage |
-| `null` `profit_loss` | Bet not yet settled |
+| Empty `price_list` | Market suspended, no bookmaker coverage, or no liquidity on that side (back/lay) |
+| `null` `profit_loss` | Bet not yet settled — order status will be `done` or earlier, not `reconciled` |
 | `null` `stake` on order | No bets filled (order timed out or was cancelled) |
 | `status: "failed"` | All placements failed — check `bets[].status.code` |
 | `updated_at_from` error | Both timestamps must be >= 60 seconds in the past |
 | Reading `price_list[0]["price"]` returns undefined | It's nested — use `price_list[0]["effective"]["price"]` |
 | Order created twice on retry | Use `request_uuid` as idempotency key |
+| `validation_error: invalid_selection` on parlay | Each leg must be a different valid market |
+| `validation_error: too_many_betslips` on parlay | Don't reuse in-flight selections across parlay legs |
+
+## Offer history caveat
+
+The `/web/offerhist/{sport}/{event_id}/{bet_type}/` endpoint currently proxies
+the upstream data as-is and **exposes per-bookie price history** with bookie
+codes like `3et`, `bdaq`, `bf`, `mbook`. This is an exception to the bookie
+abstraction — treat the output accordingly. The spec notes that aggregation
+into a best-price series is planned.
 
 ---
 

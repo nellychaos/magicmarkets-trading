@@ -1,7 +1,7 @@
 {
   "name": "magicmarkets-trading",
   "description": "Programmatic sports bet placement and order management at api.magicmarkets.com. Supports back bets (normal), lay bets, and parlays (accumulators) with aggregated bookmaker liquidity. Helps developers build trading bots, manage orders, and integrate the full betslip-to-settlement workflow using long-lived API tokens.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "MagicMarkets",
     "url": "https://magicmarkets.com"
@@ -21,6 +21,9 @@
     "lay",
     "parlay",
     "accumulator",
-    "exchange"
+    "exchange",
+    "for",
+    "against",
+    "asian-handicap"
   ]
 }
