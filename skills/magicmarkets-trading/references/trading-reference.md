@@ -166,7 +166,7 @@ Sets `cleared = true`.
 
 Access as `entry["effective"]["price"]`, not `entry["price"]`.
 
-- `price` — decimal odds, rounded up to nearest Betfair Classic ladder step
+- `price` — decimal odds, rounded up to nearest standard odds-ladder step
 - `min` — minimum stake at this level, `["USDT", amount]` or null
 - `max` — maximum stake at this level (excluding sportradar), `["USDT", amount]` or null
 

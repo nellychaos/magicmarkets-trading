@@ -678,10 +678,10 @@ When an order closes, `close_reason` explains why:
 ## Offer history caveat
 
 The `/web/offerhist/{sport}/{event_id}/{bet_type}/` endpoint currently proxies
-the upstream data as-is and **exposes per-bookie price history** with bookie
-codes like `3et`, `bdaq`, `bf`, `mbook`. This is an exception to the bookie
-abstraction — treat the output accordingly. The spec notes that aggregation
-into a best-price series is planned.
+the upstream data as-is. Today it returns per-source price history keyed by
+anonymous source identifiers — a known exception to the bookie abstraction.
+The roadmap notes aggregation into a single best-price series is planned, at
+which point this endpoint will match the abstraction model used everywhere else.
 
 ---
 
