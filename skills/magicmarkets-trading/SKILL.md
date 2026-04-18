@@ -115,6 +115,46 @@ Every response uses:
 {"status": "ok", "data": <payload>}
 ```
 
+### Event ID format
+
+All endpoints that reference an event take a string `event_id` with one of
+two shapes:
+
+**Head-to-head events:**
+
+```
+YYYY-MM-DD,<home_team_id>,<away_team_id>
+```
+
+Example: `"2026-04-15,85,89"` = a match on 2026-04-15 between team 85 (home)
+and team 89 (away). The integer team IDs are stable across calls but are
+**not enumerated** by the Trading API — there is no `/v1/events/search/`
+endpoint.
+
+**Multirunner events** (outrights, futures):
+
+```
+YYYY-MM-DD,multirunner,<event_id>
+```
+
+Example: `"2025-08-28,multirunner,47"` = a season-long outright. The
+`<event_id>` is an internal numeric ID.
+
+**Discovering event IDs and team IDs.** Since there's no search endpoint,
+you have three options:
+
+1. Subscribe to the [Datafeed](https://data.magicmarkets.com) — event
+   upserts carry `home`/`away` names alongside the `[sport, event_id]` key.
+2. Inspect existing orders — `event_info.home_id` / `event_info.away_id`
+   fields are populated in `GET /v1/orders/` responses.
+3. Use the known `event_id` if you already have it from another part of
+   your pipeline.
+
+**Matching events to external platforms.** The integer team IDs are
+MagicMarkets-internal and have no external equivalent. If you're matching
+against Polymarket, Odds API, etc., match on `(home_team, away_team, date)`
+with fuzzy name matching — not on the integer IDs.
+
 ---
 
 ## Authentication
@@ -143,6 +183,63 @@ dashboard, **not** the `X-Api-Key`:
 | `DELETE` | `/web/token/{id}/` | Soft-delete token |
 
 The `token` field in the create response is plaintext — **shown only once**.
+
+---
+
+## Betslip lifecycle and rate limits
+
+Before writing any batch workflow against this API, understand that
+betslips are **scarce, server-managed resources** with two hard
+constraints:
+
+### Concurrent betslip cap
+
+Each account has a cap on **concurrent open betslips** — exceed it and
+`POST /v1/betslips/` returns `validation_error`. The exact number is
+account-specific. Discover yours at runtime rather than hard-coding:
+
+```bash
+curl "https://api.magicmarkets.com/v1/betslips/" \
+  -H "X-Api-Key: $API_KEY"
+```
+
+This returns a list of `betslip_id`s currently open. If the list is at
+your cap, new creates will fail until one expires.
+
+### No client-side close endpoint
+
+There is **no `DELETE /v1/betslips/{id}/`** (and no PATCH, no explicit
+cancel endpoint — the entire magic-api spec is GET/POST only). Slots free
+only on server-side auto-expiry, which is typically a short window (a few
+minutes). Read the `expiry_ts` field on the response rather than
+hard-coding a timeout — it's the authoritative freeing time.
+
+### Implications for batch workflows
+
+| Your workflow | Recommendation |
+|---------------|----------------|
+| **Enriching arb candidates with live depth** | Batch well under your cap. Wait for `expiry_ts` before the next batch. |
+| **Periodic market scanning** | Use the **Datafeed** (`wss://data.magicmarkets.com`) instead. The Trading API betslip endpoint is for single-market pre-trade checks, not surveillance. |
+| **Retrying on transient failures** | Be aware a failed `POST /v1/betslips/` may still have consumed a slot you can't release. Prefer idempotency via caching your latest successful `betslip_id` over blind retries. |
+
+### When to pick the Datafeed over a betslip
+
+| You need | Use |
+|----------|-----|
+| Best decimal odds across sources, single event | Betslip |
+| Same, for a handful of events | Betslip (mind the cap) |
+| Same, for many events / continuous surveillance | Datafeed |
+| Max fillable stake at quoted price | Betslip (only source exposing `max` per price level) |
+| Full order-book depth | **Not exposed** by this API — see meta-note below |
+
+### Meta-note on depth
+
+The `price_list` array in a betslip response returns aggregated price
+levels sorted descending, but the granularity is coarse (typically 1–3
+levels) and `max` on each level reflects a per-source effective cap, not
+aggregate book depth at that price. If you need deeper order-book data,
+this API does not currently expose it. Treat `price_list` as "what's
+fillable for a single-shot order" rather than "book depth".
 
 ---
 
@@ -236,8 +333,45 @@ curl -X POST https://api.magicmarkets.com/v1/betslips/ \
 }
 ```
 
-**Important**: each price level is `{"effective": {...}}` — read
-`entry["effective"]["price"]` not `entry["price"]`. Sorted by price descending.
+**Critical: parsing `price_list` correctly.** Three gotchas bite every
+integrator at least once:
+
+1. **Nested wrapper.** Each entry is `{"effective": {...}}`, not a flat
+   price object. Read `entry["effective"]["price"]` — `entry["price"]`
+   is `undefined`.
+2. **`max` is a USDT tuple** (not a number). It's `["USDT", <float>]` or
+   `null`. Always null-check before indexing:
+
+   ```python
+   mx = entry["effective"]["max"]
+   max_usdt = mx[1] if isinstance(mx, (list, tuple)) and len(mx) >= 2 else None
+   ```
+
+3. **Empty `price_list` is a valid success state.** An empty array with
+   `status: "ok"` does **not** mean the API failed — it means this
+   market has no live offer on this side right now. Common causes:
+   one-sided book on `betslip_type: "lay"`, suspended market, or the
+   wrong `bet_type` for the sport (see Bet type patterns below). Handle
+   this explicitly; don't crash and don't treat it as an error.
+
+The list is sorted by price descending — the best available odds first.
+
+**Aggregating fillable stake above a price floor.** Because the list is
+sorted descending, you can break early:
+
+```python
+total_max = 0.0
+for entry in slip["price_list"]:
+    eff = entry.get("effective") or {}
+    if eff.get("price", 0) < min_acceptable_price:
+        break
+    mx = eff.get("max")
+    if isinstance(mx, (list, tuple)) and len(mx) >= 2 and mx[0] == "USDT":
+        total_max += float(mx[1])
+```
+
+A `total_max == 0.0` result means "the betslip succeeded but no level met
+your price threshold" — a common, legitimate state.
 
 **Query params on `POST /v1/betslips/`:**
 
@@ -596,29 +730,45 @@ for leg in order["legs"]:
 Every bet_type starts with `for,` or `against,` — see the "Two orthogonal
 dimensions" section above. Common patterns observed in production:
 
-**Match result / moneyline:**
+**Match result / moneyline — use the exact pattern for your sport.**
 
-| Pattern | Meaning |
-|---------|---------|
-| `for,mres,1` / `for,mres,x` / `for,mres,2` | Match result: home / draw / away |
-| `for,h` / `for,a` | Simple home / away (moneyline) |
-| `against,h` / `against,a` | Opposite side of simple home / away |
-| `for,ml,h` / `for,ml,a` | Moneyline home / away |
-| `for,tp,all,ml,h` | Moneyline incl. overtime, home |
-| `for,tp,reg,ml,h` | Moneyline regular time only, home |
-| `for,tp,reg,wdw,h` | Win-Draw-Win regular time, home |
+The moneyline pattern varies by sport. Using the wrong one produces an
+empty `price_list` silently — always log which `bet_type` you sent if you
+get an unexpectedly empty result.
 
-**Asian handicap and over/under:**
+| Sport | Home | Away | Draw | Notes |
+|-------|------|------|------|-------|
+| `fb` (soccer) | `for,h` | `for,a` | `for,d` | 3-way; draw required |
+| `basket` | `for,ml,h` | `for,ml,a` | — | 2-way, no draw |
+| `ih` (ice hockey) | `for,tp,all,ml,h` | `for,tp,all,ml,a` | — | Incl. OT + shootout |
+| `af` (American football) | `for,tp,all,ml,h` | `for,tp,all,ml,a` | — | Incl. OT |
+| `baseball` | `for,tp,all,ml,h` | `for,tp,all,ml,a` | — | Incl. extra innings |
+| `mma` | `for,ml,h` | `for,ml,a` | — | DNB variant: `for,dnb,h/a` |
+| `boxing` | `for,h` | `for,a` | `for,d` | DNB variant: `for,dnb,h/a` |
+| `tennis` | `for,tset,all,vset1,p1` | `for,tset,all,vset1,p2` | — | "Win total sets vs set 1, player N" |
+
+**Regulation-time variants.** For hockey / football / basketball, swap
+`tp,all,` → `tp,reg,` to restrict to regulation time (ignoring OT). You
+may also see `tp,reg,wdw,h/d/a` — regulation-time 3-way (win-draw-win).
+Markets that price regular-time and full-time separately will carry both.
+
+**Lay side.** Replace the `for,` prefix with `against,` in any pattern.
+So laying the home team in NBA is `against,ml,h`.
+
+**Asian handicap and over/under — quarter-point line encoding.**
 
 | Pattern | Meaning |
 |---------|---------|
 | `for,ah,h,-20` | Asian handicap home **-5.0** (line × 4) |
 | `for,ah,a,20` | Asian handicap away **+5.0** |
-| `for,ou,o,25` | Over (line depends on sport encoding) |
+| `for,ou,o,25` | Over (line × 4 — `25` = 6.25) |
 | `for,ou,u,25` | Under |
+| `for,ahover,N` | Combined AH-over (common in `fb_corn`, other composites) |
+| `for,ahunder,N` | Combined AH-under |
 
-Asian handicap and over/under lines are stored as integers in quarter-point
-units. Divide by 4 to get the displayed line — e.g. `-20` displays as `-5.0`.
+AH and O/U lines are integers in **quarter-point units** — divide by 4 to
+get the displayed line. So `-20` is shown as `-5.0`, `-8` is `-2.0`,
+`14` is `+3.5`, etc.
 
 **Outrights / futures (multirunner markets):**
 
@@ -671,6 +821,9 @@ When an order closes, `close_reason` explains why:
 | `status: "failed"` | All placements failed — check `bets[].status.code` |
 | `updated_at_from` error | Both timestamps must be >= 60 seconds in the past |
 | Reading `price_list[0]["price"]` returns undefined | It's nested — use `price_list[0]["effective"]["price"]` |
+| `max` field is not a number when you try to do math on it | It's a USDT tuple `["USDT", n]` — use `max[1]` (after null-check) |
+| Empty `price_list` with `status: "ok"` | Valid state: one-sided book, suspended market, or wrong `bet_type` for the sport — treat as "no liquidity", not an error |
+| `validation_error` on `POST /v1/betslips/` after several creates | You hit the concurrent cap — probe `GET /v1/betslips/` and wait for `expiry_ts` |
 | Order created twice on retry | Use `request_uuid` as idempotency key |
 | `validation_error: invalid_selection` on parlay | Each leg must be a different valid market |
 | `validation_error: too_many_betslips` on parlay | Don't reuse in-flight selections across parlay legs |
@@ -682,6 +835,33 @@ the upstream data as-is. Today it returns per-source price history keyed by
 anonymous source identifiers — a known exception to the bookie abstraction.
 The roadmap notes aggregation into a single best-price series is planned, at
 which point this endpoint will match the abstraction model used everywhere else.
+
+---
+
+## Known limitations
+
+Call these out explicitly when evaluating fit for a use case — they bite
+integrators who don't see them coming.
+
+- **Concurrent open betslips are capped per account** — see the "Betslip
+  lifecycle" section. There is **no close/delete endpoint**; slots free
+  only on server-side auto-expiry. Batch workflows must pace themselves
+  or use the Datafeed instead.
+- **No order-book depth beyond `price_list`** — `price_list` returns 1–3
+  aggregated levels with per-source `max`, not full aggregate book depth.
+- **No event/market search endpoint** — `/v1/events/search/` doesn't
+  exist. Discover event IDs via the Datafeed or from existing orders.
+- **No client-editable state on betslips or orders** — the entire
+  magic-api spec is GET/POST only. No PATCH, no DELETE, no cancellation
+  endpoint. To stop an open order, wait for `expiry_time` or use
+  `force_want_price` + price moves to avoid fills.
+- **Offer history exposes per-source time series** — the
+  `/web/offerhist/` endpoint currently proxies upstream data without
+  aggregation. Aggregation into a single best-price series is planned.
+- **Bet type grammar is not enumerable** — the canonical patterns are
+  observed from live usage; there is no schema endpoint listing every
+  valid `bet_type` string per sport. See the sport-keyed table above
+  for the validated set.
 
 ---
 
