@@ -189,38 +189,63 @@ The `token` field in the create response is plaintext — **shown only once**.
 ## Betslip lifecycle and rate limits
 
 Before writing any batch workflow against this API, understand that
-betslips are **scarce, server-managed resources** with two hard
-constraints:
+betslips are **scarce, server-managed resources** with real constraints
+on concurrency and lifetime.
 
 ### Concurrent betslip cap
 
-Each account has a cap on **concurrent open betslips** — exceed it and
-`POST /v1/betslips/` returns `validation_error`. The exact number is
-account-specific. Discover yours at runtime rather than hard-coding:
+Each account has a cap on **concurrent open betslips**. Exceeding it
+returns HTTP 403 with this exact shape:
+
+```json
+{"status":"error","code":"too_many_open_betslips","data":null}
+```
+
+The number varies by account. On a standard production account it has
+been observed at **9 concurrent open slots**. Don't hard-code it — probe
+live to see both your current count and (if you're at the cap) the ceiling:
 
 ```bash
 curl "https://api.magicmarkets.com/v1/betslips/" \
   -H "X-Api-Key: $API_KEY"
 ```
 
-This returns a list of `betslip_id`s currently open. If the list is at
-your cap, new creates will fail until one expires.
+Returns an array of currently-open `betslip_id`s. If you're at your cap,
+either wait for auto-expiry or explicitly free a slot (see below).
 
-### No client-side close endpoint
+### Freeing slots: `DELETE` works (though it's undocumented)
 
-There is **no `DELETE /v1/betslips/{id}/`** (and no PATCH, no explicit
-cancel endpoint — the entire magic-api spec is GET/POST only). Slots free
-only on server-side auto-expiry, which is typically a short window (a few
-minutes). Read the `expiry_ts` field on the response rather than
-hard-coding a timeout — it's the authoritative freeing time.
+`DELETE /v1/betslips/{id}/` is **not documented in the OpenAPI spec**
+but is fully functional. It returns:
+
+```json
+{"data": null, "status": "ok"}
+```
+
+HTTP 200. Slot count drops by one immediately; a fresh `POST` succeeds
+right after. Use this whenever you know you're done with a betslip
+— don't wait for auto-expiry if you're running tight against the cap.
+
+`PATCH` and `PUT` on the same path both return HTTP 405 `Method not
+allowed`. The only mutations are `POST` (create) and `DELETE` (close).
+
+### Auto-expiry
+
+Every betslip response carries an `expiry_ts` field (Unix seconds). On
+a standard production account this has been observed at **~45 seconds
+after creation**. Read the field rather than hard-coding a timer — the
+window could change, and the field is always authoritative.
+
+After `expiry_ts`, the slot frees automatically (without a `DELETE`).
 
 ### Implications for batch workflows
 
 | Your workflow | Recommendation |
 |---------------|----------------|
-| **Enriching arb candidates with live depth** | Batch well under your cap. Wait for `expiry_ts` before the next batch. |
-| **Periodic market scanning** | Use the **Datafeed** (`wss://data.magicmarkets.com`) instead. The Trading API betslip endpoint is for single-market pre-trade checks, not surveillance. |
-| **Retrying on transient failures** | Be aware a failed `POST /v1/betslips/` may still have consumed a slot you can't release. Prefer idempotency via caching your latest successful `betslip_id` over blind retries. |
+| **Enriching ≤ cap candidates with live depth** | Fine to fire in parallel; DELETE each one as you finish its check, or just let the ~45s auto-expiry free them before your next sweep. |
+| **Enriching many candidates** | Process in batches ≤ cap. Between batches, either `DELETE` each betslip you're done with or sleep past `expiry_ts`. |
+| **Periodic market scanning** | Use the **Datafeed** (`wss://data.magicmarkets.com`) — betslips are for single-market pre-trade checks, not surveillance. |
+| **Retrying on transient failures** | Validation failures (HTTP 400) do **not** consume a slot, so safe to retry. A successful `POST` that you then abandon will auto-free in ~45s, or you can explicitly `DELETE` it. |
 
 ### When to pick the Datafeed over a betslip
 
@@ -732,9 +757,12 @@ dimensions" section above. Common patterns observed in production:
 
 **Match result / moneyline — use the exact pattern for your sport.**
 
-The moneyline pattern varies by sport. Using the wrong one produces an
-empty `price_list` silently — always log which `bet_type` you sent if you
-get an unexpectedly empty result.
+The moneyline pattern varies by sport. **Using a wrong pattern for the
+sport is rejected loudly** — `POST /v1/betslips/` returns HTTP 400
+`{"code":"validation_error","data":{"validation_errors":{"bet_type":["invalid_bet_type"]}}}`
+— it does not silently return an empty `price_list`. (Empty `price_list`
+on a successful response means the pattern is valid but no live offer
+exists on that side — suspended market, one-sided book, etc.)
 
 | Sport | Home | Away | Draw | Notes |
 |-------|------|------|------|-------|
@@ -753,7 +781,9 @@ may also see `tp,reg,wdw,h/d/a` — regulation-time 3-way (win-draw-win).
 Markets that price regular-time and full-time separately will carry both.
 
 **Lay side.** Replace the `for,` prefix with `against,` in any pattern.
-So laying the home team in NBA is `against,ml,h`.
+So laying the home team in NBA is `against,ml,h`. Combined with
+`betslip_type: "lay"` or `"normal"` this gives you the four-way matrix
+described in "Two orthogonal dimensions" above.
 
 **Asian handicap and over/under — quarter-point line encoding.**
 
@@ -822,8 +852,9 @@ When an order closes, `close_reason` explains why:
 | `updated_at_from` error | Both timestamps must be >= 60 seconds in the past |
 | Reading `price_list[0]["price"]` returns undefined | It's nested — use `price_list[0]["effective"]["price"]` |
 | `max` field is not a number when you try to do math on it | It's a USDT tuple `["USDT", n]` — use `max[1]` (after null-check) |
-| Empty `price_list` with `status: "ok"` | Valid state: one-sided book, suspended market, or wrong `bet_type` for the sport — treat as "no liquidity", not an error |
-| `validation_error` on `POST /v1/betslips/` after several creates | You hit the concurrent cap — probe `GET /v1/betslips/` and wait for `expiry_ts` |
+| Empty `price_list` with `status: "ok"` | Valid state: one-sided book, suspended market, or pre-match with no quotes yet — treat as "no liquidity", not an error |
+| HTTP 400 `validation_error: invalid_bet_type` | Wrong pattern for the sport. Check the sport-keyed table above and log the exact `bet_type` you sent |
+| HTTP 403 `too_many_open_betslips` | Concurrent cap hit. Either `DELETE /v1/betslips/{id}/` on one you're done with, or wait past the `expiry_ts` of one (auto-expiry is ~45s) |
 | Order created twice on retry | Use `request_uuid` as idempotency key |
 | `validation_error: invalid_selection` on parlay | Each leg must be a different valid market |
 | `validation_error: too_many_betslips` on parlay | Don't reuse in-flight selections across parlay legs |
@@ -844,24 +875,24 @@ Call these out explicitly when evaluating fit for a use case — they bite
 integrators who don't see them coming.
 
 - **Concurrent open betslips are capped per account** — see the "Betslip
-  lifecycle" section. There is **no close/delete endpoint**; slots free
-  only on server-side auto-expiry. Batch workflows must pace themselves
-  or use the Datafeed instead.
+  lifecycle" section. Slots free on auto-expiry (~45s) or via
+  `DELETE /v1/betslips/{id}/` (undocumented in OpenAPI but fully
+  functional). For continuous surveillance use the Datafeed instead.
 - **No order-book depth beyond `price_list`** — `price_list` returns 1–3
   aggregated levels with per-source `max`, not full aggregate book depth.
 - **No event/market search endpoint** — `/v1/events/search/` doesn't
   exist. Discover event IDs via the Datafeed or from existing orders.
-- **No client-editable state on betslips or orders** — the entire
-  magic-api spec is GET/POST only. No PATCH, no DELETE, no cancellation
-  endpoint. To stop an open order, wait for `expiry_time` or use
-  `force_want_price` + price moves to avoid fills.
+- **Orders can't be cancelled client-side** — no PATCH or DELETE is
+  defined on `/v1/orders/{id}/`. To stop an open order, wait for
+  `expiry_time` or use `force_want_price` + price moves to avoid fills.
 - **Offer history exposes per-source time series** — the
   `/web/offerhist/` endpoint currently proxies upstream data without
   aggregation. Aggregation into a single best-price series is planned.
 - **Bet type grammar is not enumerable** — the canonical patterns are
   observed from live usage; there is no schema endpoint listing every
   valid `bet_type` string per sport. See the sport-keyed table above
-  for the validated set.
+  for the validated set. Invalid patterns are rejected cleanly with
+  `validation_error: invalid_bet_type`.
 
 ---
 
